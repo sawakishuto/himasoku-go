@@ -6,15 +6,12 @@ import (
 
 	firebase "firebase.google.com/go/v4"
 	firebaseauth "firebase.google.com/go/v4/auth"
-	"google.golang.org/api/option"
 )
 
 func NewFirebaseAuthClient() (*firebaseauth.Client, error) {
 	ctx := context.Background()
 
-	opt := option.WithCredentialsFile("path/to/credentials.json")
-
-	app, err := firebase.NewApp(ctx, nil, opt)
+	app, err := firebase.NewApp(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create firebase app: %w", err)
 	}
