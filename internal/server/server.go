@@ -2,21 +2,35 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/sawakishuto/himasoku-go/internal/auth"
 	"github.com/sawakishuto/himasoku-go/internal/handler"
+	"github.com/sawakishuto/himasoku-go/internal/handler/middleware"
 )
 
 func Run(ctx context.Context) error {
 	// SIGINT / SIGTERM を受けたら ctx がキャンセルされる
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	client, err := auth.NewFirebaseAuthClient()
+	if err != nil {
+		return fmt.Errorf("failed to create firebase auth client: %w", err)
+	}
+	authn := middleware.NewAuthenticator(client)
+
+	// 認証が必要なルートはこちらに登録する。登録するだけで保護される。
+	api := http.NewServeMux()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handler.Health)
+	mux.Handle("/", authn.Require(api))
 
 	srv := &http.Server{
 		Addr:    ":8080",
