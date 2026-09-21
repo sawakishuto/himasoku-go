@@ -1,0 +1,31 @@
+# ビルド成果物
+bin/
+*.exe
+*.test
+
+# テスト・プロファイル
+coverage.out
+coverage.html
+*.prof
+
+# 環境変数（.env.example のみコミットする）
+.env
+.env.*
+!.env.example
+
+# APNs の認証キー・証明書
+*.p8
+*.p12
+*.pem
+*.key
+*.cer
+
+# エディタ・OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ローカル作業用
+tmp/
+vendor/
