@@ -7,7 +7,7 @@ MIGRATIONS_DIR := db/migrations
 
 # ローカル開発用。docker-compose.yml の設定と揃えてある。
 # 本番などでは環境変数で上書きする: make migrate-up DATABASE_URL=postgres://...
-DATABASE_URL ?= postgres://himasoku:himasoku@localhost:5432/himasoku?sslmode=disable
+DATABASE_URL ?= postgres://himasoku:himasoku@localhost:15432/himasoku?sslmode=disable
 
 .PHONY: help
 help: ## このヘルプを表示

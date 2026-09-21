@@ -6,8 +6,9 @@ services:
       POSTGRES_USER: himasoku
       POSTGRES_PASSWORD: himasoku
       POSTGRES_DB: himasoku
+    # ホスト側は 15432。他プロジェクトの DB が 5432 を使うため衝突を避ける。
     ports:
-      - "5432:5432"
+      - "15432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
