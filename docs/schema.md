@@ -8,6 +8,7 @@
 
 ```mermaid
 erDiagram
+    users ||--o{ user_identities : "連携する"
     users ||--o{ devices : "所有する"
     users ||--o{ group_members : "所属する"
     groups ||--o{ group_members : "メンバーを持つ"
@@ -25,10 +26,13 @@ erDiagram
 
 ### 主キーは内部の uuid にする
 
-`firebase_uid` や APNs デバイストークンは外部システムが発行する識別子であり、
+ID トークンの `sub` や APNs デバイストークンは外部システムが発行する識別子であり、
 値が変わりうる。特に APNs トークンはアプリの再インストールで再発行される。
 これを主キーに置くと、値が変わった時点で古い行が孤児として残り、
 新旧を紐づける手段が無くなる。外部の識別子は UNIQUE 制約付きの通常の列として持つ。
+
+`sub` については、認証プロバイダを増やせるよう
+[`user_identities`](#user_identities) という別テーブルに切り出している。
 
 ### 消さずに打刻する
 
@@ -66,13 +70,59 @@ CREATE UNIQUE INDEX group_members_active_uniq
 | カラム | 型 | 制約・備考 |
 |--------|----|-----------|
 | `id` | `uuid` | 主キー。`gen_random_uuid()` |
-| `firebase_uid` | `text` | NOT NULL / UNIQUE |
 | `display_name` | `text` | NOT NULL |
 | `email` | `text` | UNIQUE。匿名ログインを許容するため NULL 可 |
 | `created_at` / `updated_at` | `timestamptz` | NOT NULL |
 
 `email` を NULL 可にしているのは Firebase の匿名認証に対応するため。
 PostgreSQL の UNIQUE は NULL を重複とみなさないので、複数行が NULL でも問題ない。
+
+認証の識別子はこのテーブルに置かない。`users` は
+[UC-07](usecases/groups.md#uc-07-グループメンバーの一覧) のメンバー一覧で
+広く参照されるため、サインインの主体を特定できる値を同居させたくない。
+
+### user_identities
+
+| カラム | 型 | 制約・備考 |
+|--------|----|-----------|
+| `id` | `uuid` | 主キー |
+| `user_id` | `uuid` | NOT NULL → `users(id)` ON DELETE CASCADE |
+| `provider` | `text` | NOT NULL CHECK IN (`firebase`, `google`, `apple`, `line`) |
+| `subject` | `text` | NOT NULL。ID トークンの `sub` クレーム |
+| `created_at` / `updated_at` | `timestamptz` | NOT NULL |
+
+1 人の利用者が複数のプロバイダでサインインできるように、認証の識別子を
+別テーブルへ切り出している。`users.firebase_uid` の列のままでは
+1 対 1 に固定され、プロバイダを増やすたびに列が増える。
+
+#### キーが (provider, subject) の組である理由
+
+OIDC の `sub` は **発行者（`iss`）の中でしか一意性が保証されない**。
+異なるプロバイダが同じ `sub` 文字列を発行する可能性は仕様上排除されていない。
+
+```sql
+CONSTRAINT user_identities_provider_subject_uniq UNIQUE (provider, subject)
+```
+
+`provider` は `iss` と 1 対 1 に対応する短い名前で、対応付けはトークン検証層が持つ。
+`iss` をそのまま持たないのは、URL の表記揺れを索引に持ち込まないため。
+
+この UNIQUE はもう 1 つの役割を果たす。他人の連携を自分に付け替えようとする
+INSERT を弾くので、アカウント乗っ取りの経路がここで閉じる。
+
+#### 連携の追加
+
+新しいプロバイダの連携は素の INSERT で行える。RLS の
+`user_id = app_current_user_id()` が自分の行に限定し、上の UNIQUE が
+既に誰かのものになっている identity を拒否する。専用の関数は要らない。
+
+```sql
+CREATE UNIQUE INDEX user_identities_user_provider_uniq
+    ON user_identities (user_id, provider);
+```
+
+こちらは「同じプロバイダを 1 人に二重に紐づけない」ための制約で、
+`user_id` での引き当て（連携済み一覧）の索引も兼ねる。
 
 ### devices
 
@@ -229,6 +279,7 @@ SET LOCAL app.current_user_id = '<users.id>';
 | テーブル | SELECT | INSERT | UPDATE |
 |---------|--------|--------|--------|
 | `users` | RLS なし | RLS なし | RLS なし |
+| `user_identities` | 自分の行のみ | 自分の行のみ | 自分の行のみ |
 | `devices` | 自分の行のみ | 自分の行のみ | 自分の行のみ |
 | `groups` | 在籍中のグループ | `created_by` が自分 | ポリシーなし（不可） |
 | `group_members` | 在籍中のグループの全員 | 自分の行のみ | 自分の行のみ |
@@ -243,15 +294,17 @@ SET LOCAL app.current_user_id = '<users.id>';
 
 ### users に RLS を掛けない理由
 
-2 つある。
+[UC-07](usecases/groups.md#uc-07-グループメンバーの一覧) で同じグループの
+他人の `display_name` を読む必要があるため。「自分の行だけ」では成立しない。
 
-1. 認証ミドルウェアは `firebase_uid` から `users.id` を引く。この時点では
-   `app.current_user_id` がまだ確定しておらず、自分の行すら見えない。
-2. [UC-07](usecases/groups.md#uc-07-グループメンバーの一覧) で同じグループの
-   他人の `display_name` を読む必要がある。「自分の行だけ」では成立しない。
+「同じグループの在籍者なら見える」ポリシーを書くこともできるが、
+`users` を引くほぼ全ての経路にグループ越しの判定が乗ることになる。
+`display_name` は元々グループ内に公開される情報なので、割に合わない。
 
-代償として、アプリロールは全ユーザーの `email` と `firebase_uid` を
-読めてしまう。外部に出す列はハンドラ側で絞る。
+代償として、アプリロールは全ユーザーの `email` を読める。
+外部に出す列はハンドラ側で絞る。認証の識別子は
+[`user_identities`](#user_identities) に切り出してあるため、
+ここには含まれない。
 
 ### なりすましをポリシーで塞ぐ
 
@@ -286,8 +339,14 @@ ERROR:  new row violates row-level security policy for table "notifications"
 
 | 関数 | 用途 | ポリシーで書けない理由 |
 |------|------|---------------------|
+| `resolve_user_by_identity(provider, subject)` | `sub` から `users.id` を引く（認証ミドルウェア） | `app.current_user_id` の確定前に呼ぶため、自分の行すら見えない |
+| `register_user(provider, subject, display_name, email)` | ユーザー登録（[UC-01](usecases/onboarding.md#uc-01-ユーザー登録)） | 同上。加えて 2 テーブルへの冪等な書き込みが 1 文で書けない |
 | `register_device(platform, push_token, apns_env)` | 端末の所有者付け替え（[UC-02](usecases/onboarding.md#uc-02-デバイストークンの登録)） | 対象が他人の行。許すポリシーは端末乗っ取りを許すことになる |
 | `join_group_by_invite_code(code)` | 招待コードでの参加（[UC-05](usecases/groups.md#uc-05-招待コードでグループに参加)） | 参加前は非メンバーなので `groups` が一行も見えない |
+
+本人確認そのものは、業務のリクエストより一段内側の操作になる。
+`app.current_user_id` を設定するための情報を得る処理なので、
+その値に依存するポリシーの下には置けない。
 
 `app_is_group_member(group_id)` も `SECURITY DEFINER` にしている。
 `group_members` のポリシーから `group_members` を引くと
@@ -312,7 +371,7 @@ ERROR:  new row violates row-level security policy for table "notifications"
 
 | 既存（Rails） | 新設計（Go） | 理由 |
 |--------------|-------------|------|
-| `users.firebase_uid` が主キー | `users.id` が主キー、`firebase_uid` は UNIQUE 列 | 認証基盤を差し替えても内部 ID と全 FK が壊れない |
+| `users.firebase_uid` が主キー | `users.id` が主キー、認証の識別子は `user_identities` | 認証基盤を差し替えても内部 ID と全 FK が壊れない。複数プロバイダも列を増やさずに扱える |
 | `user_devices.device_id`（APNs トークン）が主キー | `devices.id` が主キー、`push_token` は UNIQUE 列 | トークンは再発行される。主キーだと旧行が孤児化し、失効も表現できない |
 | クライアントが `group_id` を決めて POST | サーバー生成の `id` と `invite_code` | ID を推測した不正参加や、既存グループの上書きを防ぐ |
 | 退出の概念なし | `group_members.left_at` | 通知を止める手段を用意する |

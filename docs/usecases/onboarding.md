@@ -8,8 +8,15 @@
 ## 認証と登録を分ける
 
 サインイン（本人確認）とユーザー登録（プロフィールの永続化）は別の関心事として扱う。
-認証ミドルウェアは ID トークンを検証し、`sub` から `users` を **引くだけ** で、
+認証ミドルウェアは ID トークンを検証し、`sub` から `users.id` を **引くだけ** で、
 行が無くてもエラーにしない。行を作るかどうかを決めるのは `POST /users` だけ。
+
+引き当ては `user_identities` を経由する。`sub` が一意なのは発行者ごとなので、
+プロバイダと組にして初めてキーになる（[テーブル設計](../schema.md#user_identities) を参照）。
+
+```sql
+SELECT resolve_user_by_identity('firebase', $1);  -- $1 = token.Subject
+```
 
 この結果、リクエストは 3 つの層のいずれかに属する。
 
@@ -26,7 +33,7 @@
 flowchart LR
     R[リクエスト] --> A{ID トークンは有効か}
     A -->|いいえ| E401[401 Unauthorized]
-    A -->|はい| B[sub で users を引く<br/>見つからなくてもよい]
+    A -->|はい| B[provider と sub で user_identities を引く<br/>見つからなくてもよい]
     B --> C{登録必須のルートか}
     C -->|いいえ<br/>GET /me, POST /users| H[ハンドラへ]
     C -->|はい| D{users の行はあるか}
@@ -65,7 +72,7 @@ SET LOCAL app.current_user_id = '<users.id>';
 { "display_name": "さわき", "email": "sawaki@example.com" }
 ```
 
-`firebase_uid` はリクエストボディで受け取らない。ID トークンの `sub` から取る。
+プロバイダと `sub` はリクエストボディで受け取らない。検証済みの ID トークンから取る。
 クライアントの申告を信じると、任意の利用者になりすませてしまう。
 
 ```mermaid
@@ -80,18 +87,18 @@ sequenceDiagram
     API->>Firebase: 公開鍵を取得 (初回のみ。以降はメモリキャッシュ)
     Firebase-->>API: x509 証明書
     API->>API: RS256 で署名検証し sub を取り出す
-    API->>DB: SELECT * FROM users WHERE firebase_uid = $1
+    API->>DB: SELECT resolve_user_by_identity('firebase', sub)
 
     alt 登録済み
-        DB-->>API: ユーザー行
+        DB-->>API: users.id
         API-->>iOS: 200 OK (プロフィール)
         Note over iOS: ホーム画面へ
     else 未登録
-        DB-->>API: 0 件
+        DB-->>API: NULL
         API-->>iOS: 404 Not Found
         Note over iOS: プロフィール設定画面へ
         iOS->>API: POST /users (display_name, email)
-        API->>DB: INSERT ... ON CONFLICT (firebase_uid) DO UPDATE ... RETURNING *, (xmax = 0)
+        API->>DB: SELECT * FROM register_user('firebase', sub, display_name, email)
         DB-->>API: 確定した行と、新規作成かどうか
         API-->>iOS: 201 Created (プロフィール)
     end
@@ -103,22 +110,43 @@ sequenceDiagram
 2 つのリクエストが同時に「行が無い」と判断し、後発が UNIQUE 制約違反で
 `500` になる。アプリ起動直後に複数の API を並行で叩くと現実に起きる。
 
-1 文の upsert にすれば分岐自体が消える。
+`users` と `user_identities` の 2 テーブルに書くため、`ON CONFLICT` の
+1 文では冪等にできない。CTE で素直に書くと壊れる。
 
 ```sql
-INSERT INTO users (firebase_uid, display_name, email)
-VALUES ($1, $2, $3)
-ON CONFLICT (firebase_uid) DO UPDATE
-    SET display_name = EXCLUDED.display_name,
-        email        = COALESCE(EXCLUDED.email, users.email)
-RETURNING *, (xmax = 0) AS created;
+WITH new_user AS (
+    INSERT INTO users (display_name, email) VALUES ($3, $4) RETURNING id
+)
+INSERT INTO user_identities (user_id, provider, subject)
+SELECT id, $1, $2 FROM new_user
+ON CONFLICT (provider, subject) DO NOTHING;
 ```
 
-`xmax = 0` は、その行がこのステートメントで新規挿入されたことを示す。
-更新された既存行では `xmax` に更新元のトランザクション ID が入る。
-これで `201` と `200` を同じクエリで出し分けられる。
+`ON CONFLICT DO NOTHING` が効くのは `user_identities` 側だけで、
+**CTE の `users` への INSERT は競合に関係なく実行される**。
+同じ `sub` で 2 回呼ぶと、誰にも紐づかない `users` 行が 1 件残る。
 
-`POST /users` を冪等にしているので、再送やリトライで壊れない。
+そのため登録は `register_user()` に閉じ込めている。
+`EXCEPTION` ブロックが暗黙のセーブポイントを作るので、競合したときだけ
+`users` の INSERT を巻き戻して引き直せる。
+
+```sql
+BEGIN
+    INSERT INTO users ... RETURNING id INTO v_user_id;
+    INSERT INTO user_identities (user_id, provider, subject) VALUES (...);
+    v_created := true;
+EXCEPTION WHEN unique_violation THEN
+    -- 同時に別のリクエストが作った。このブロックの変更だけが巻き戻る
+    SELECT i.user_id INTO v_user_id FROM user_identities i
+     WHERE i.provider = p_provider AND i.subject = p_subject;
+    IF v_user_id IS NULL THEN
+        RAISE;  -- email の一意制約など、競合以外の理由はそのまま返す
+    END IF;
+END;
+```
+
+戻り値の `created` で `201` と `200` を出し分ける。
+`POST /users` は冪等なので、再送やリトライで壊れない。
 
 ### 表示名の扱い
 
@@ -143,6 +171,8 @@ Google サインインは完了したがプロフィール設定前にアプリ�
 |------|-------|-----|
 | プロビジョニングの契機 | 認証時に `find_or_provision_user` が暗黙に作成 | `POST /users` の明示的な呼び出し |
 | 認証層の副作用 | DB への書き込みあり | 参照のみ |
+| 認証の識別子 | `users.firebase_uid` 列 | `user_identities (provider, subject)` |
+| 複数プロバイダ | 1 人 1 UID に固定 | 1 人に複数の連携を持てる |
 | 表示名 | トークンの `name` を優先 | 利用者の入力を優先 |
 | 公開鍵のキャッシュ | Redis | プロセス内メモリ（TTL は `Cache-Control` に従う） |
 
@@ -252,7 +282,8 @@ sequenceDiagram
     participant DB
 
     iOS->>API: GET /me
-    API->>DB: SELECT id, display_name, email FROM users WHERE firebase_uid = $1
+    API->>DB: SELECT resolve_user_by_identity('firebase', sub)
+    API->>DB: SELECT id, display_name, email FROM users WHERE id = $1
 
     alt 登録済み
         DB-->>API: ユーザー行

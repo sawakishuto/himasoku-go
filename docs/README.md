@@ -58,9 +58,13 @@ Authorization: Bearer <Firebase ID Token>
 ```
 
 API は Firebase の公開鍵で ID トークンを RS256 検証し、ペイロードの `sub` を
-`firebase_uid` として扱う。検証に失敗した場合は `401` を返す。
+プロバイダ名と組にして [`user_identities`](schema.md#user_identities) から
+`users.id` を引く。検証に失敗した場合は `401` を返す。
 
-認証層が行うのは検証と `users` の **参照** までで、行の作成は行わない。
+`sub` の一意性は発行者（`iss`）の中でしか保証されないため、単体ではキーにならない。
+1 人の利用者が複数のプロバイダでサインインできるのも、この構造による。
+
+認証層が行うのは検証と `users.id` の **参照** までで、行の作成は行わない。
 そのため「トークンは有効だが `users` に行が無い」状態が存在し、
 エンドポイントは要求するものによって 3 つの層に分かれる。
 
@@ -87,7 +91,7 @@ SET LOCAL app.current_user_id = '<users.id>';
 
 ### 識別子
 
-API が外部に出す ID はすべて `uuid` の文字列表現。`firebase_uid` と APNs
+API が外部に出す ID はすべて `uuid` の文字列表現。ID トークンの `sub` と APNs
 デバイストークンは外部システムの識別子であり、内部の主キーではない。
 スキーマの詳細は [テーブル設計](schema.md) を参照。
 

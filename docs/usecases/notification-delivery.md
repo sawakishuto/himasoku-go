@@ -118,7 +118,7 @@ DB 構造を変えてもこのキー名と型は変更できない。
 | キー | 型 | 供給元 |
 |------|----|--------|
 | `notification_id` | String | `notifications.id` |
-| `sender_firebase_uid` | String | `availabilities.user_id` → `users.firebase_uid` |
+| `sender_firebase_uid` | String | `availabilities.user_id` → `user_identities.subject`（`provider = 'firebase'`） |
 | `sender_name` | String | `users.display_name` |
 | `group_id` | String | `availabilities.group_id` |
 | `durationTime` | **String** | `availabilities.duration_minutes` を文字列化 |
@@ -127,6 +127,12 @@ DB 構造を変えてもこのキー名と型は変更できない。
 > 30 秒の自動辞退（[UC-11](availability-sharing.md#uc-11-無操作による自動辞退)）が
 > 静かに動かなくなる。通知自体は表示されるため気づきにくい。
 > DB では `int` で持ち、ペイロード生成時に必ず文字列へ変換する。
+
+`sender_firebase_uid` というキー名は iOS 側の契約なので変えられないが、
+供給元は [`user_identities`](../schema.md#user_identities) に移っている。
+Firebase 以外のプロバイダだけで登録された利用者は、この値を持たない。
+クライアント側の契約を見直せるタイミングで `sender_user_id`（`users.id`）へ
+寄せておきたい。
 
 結果通知では次の 3 キーを送る。
 
