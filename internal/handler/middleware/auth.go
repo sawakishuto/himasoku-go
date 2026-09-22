@@ -6,16 +6,16 @@ import (
 	"net/http"
 	"strings"
 
-	firebaseauth "firebase.google.com/go/v4/auth"
+	"github.com/sawakishuto/himasoku-go/internal/auth"
 )
 
 var errMissingBearer = errors.New("authorization header is missing or malformed")
 
 type Authenticator struct {
-	client *firebaseauth.Client
+	client auth.Client
 }
 
-func NewAuthenticator(client *firebaseauth.Client) *Authenticator {
+func NewAuthenticator(client auth.Client) *Authenticator {
 	return &Authenticator{client: client}
 }
 
@@ -31,13 +31,13 @@ func (a *Authenticator) Require(next http.Handler) http.Handler {
 	})
 }
 
-func (a *Authenticator) verify(r *http.Request) (*firebaseauth.Token, error) {
-	// VerifyIDToken は JWT 本体を期待する。"Bearer " が付いたままだと失敗する。
+func (a *Authenticator) verify(r *http.Request) (*auth.Token, error) {
+	// 検証側は JWT 本体を期待する。"Bearer " が付いたままだと必ず失敗する。
 	raw, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !ok || raw == "" {
 		return nil, errMissingBearer
 	}
-	return a.client.VerifyIDToken(r.Context(), raw)
+	return a.client.VerifyToken(r.Context(), raw)
 }
 
 // 失敗理由は返さない。総当たりの手掛かりになる。
@@ -49,11 +49,11 @@ type ctxKey struct{}
 
 var tokenKey ctxKey
 
-func withToken(ctx context.Context, token *firebaseauth.Token) context.Context {
+func withToken(ctx context.Context, token *auth.Token) context.Context {
 	return context.WithValue(ctx, tokenKey, token)
 }
 
-func TokenFrom(ctx context.Context) (*firebaseauth.Token, bool) {
-	token, ok := ctx.Value(tokenKey).(*firebaseauth.Token)
+func TokenFrom(ctx context.Context) (*auth.Token, bool) {
+	token, ok := ctx.Value(tokenKey).(*auth.Token)
 	return token, ok
 }

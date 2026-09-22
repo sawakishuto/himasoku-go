@@ -2,23 +2,23 @@ package auth
 
 import (
 	"context"
-	"fmt"
-
-	firebase "firebase.google.com/go/v4"
-	firebaseauth "firebase.google.com/go/v4/auth"
 )
 
-func NewFirebaseAuthClient() (*firebaseauth.Client, error) {
-	ctx := context.Background()
+type Token struct {
+	AuthTime int64
+	Issuer   string
+	Audience string
+	Expires  int64
+	IssuedAt int64
+	Subject  string
+	UID      string
+	Claims   map[string]interface{}
+}
 
-	app, err := firebase.NewApp(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create firebase app: %w", err)
-	}
+type Client interface {
+	VerifyToken(ctx context.Context, rawToken string) (*Token, error)
+}
 
-	client, err := app.Auth(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create firebase auth client: %w", err)
-	}
-	return client, nil
+func NewClient() (Client, error) {
+	return NewFirebaseAuthClient()
 }
