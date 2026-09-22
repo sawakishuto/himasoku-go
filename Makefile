@@ -7,7 +7,12 @@ MIGRATIONS_DIR := db/migrations
 
 # ローカル開発用。docker-compose.yml の設定と揃えてある。
 # 本番などでは環境変数で上書きする: make migrate-up DATABASE_URL=postgres://...
-DATABASE_URL ?= postgres://himasoku:himasoku@localhost:15432/himasoku?sslmode=disable
+#
+# 接続先は 2 つある。用途を取り違えると RLS が無効になるので注意すること。
+#   DATABASE_URL     所有者 himasoku。BYPASSRLS を持つ。マイグレーションと配信ワーカー用
+#   APP_DATABASE_URL himasoku_app。RLS が適用される。API のリクエスト処理用
+DATABASE_URL     ?= postgres://himasoku:himasoku@localhost:15432/himasoku?sslmode=disable
+APP_DATABASE_URL ?= postgres://himasoku_app:himasoku_app@localhost:15432/himasoku?sslmode=disable
 
 .PHONY: help
 help: ## このヘルプを表示
@@ -74,10 +79,24 @@ db-reset: ## DB をボリュームごと作り直してマイグレーション�
 	@echo "PostgreSQL の起動を待っています..."
 	@until docker compose exec -T postgres pg_isready -U himasoku >/dev/null 2>&1; do sleep 1; done
 	$(MAKE) migrate-up
+	$(MAKE) db-app-password
+
+.PHONY: db-app-password
+db-app-password: ## ローカル用に himasoku_app のパスワードを設定する
+	@# マイグレーションはロールを PASSWORD NULL で作る。資格情報をリポジトリに
+	@# 残さないため、ローカルの値だけここで与える。本番はシークレット管理側で設定する。
+	docker compose exec -T postgres psql -U himasoku -d himasoku -q \
+		-c "ALTER ROLE himasoku_app WITH PASSWORD 'himasoku_app';"
 
 .PHONY: psql
-psql: ## ローカル DB に psql で接続する
+psql: ## ローカル DB に psql で接続する (所有者。RLS は適用されない)
 	docker compose exec postgres psql -U himasoku -d himasoku
+
+.PHONY: psql-app
+psql-app: ## アプリロールで psql 接続する (RLS の挙動を確認したいとき)
+	@echo "SET app.current_user_id = '<users.id>'; を実行してから参照すること"
+	docker compose exec -e PGPASSWORD=himasoku_app postgres \
+		psql -h 127.0.0.1 -U himasoku_app -d himasoku
 
 # ---------------------------------------------------------------- マイグレーション
 
