@@ -340,7 +340,7 @@ ERROR:  new row violates row-level security policy for table "notifications"
 | 関数 | 用途 | ポリシーで書けない理由 |
 |------|------|---------------------|
 | `resolve_user_by_identity(provider, subject)` | `sub` から `users.id` を引く（認証ミドルウェア） | `app.current_user_id` の確定前に呼ぶため、自分の行すら見えない |
-| `register_user(provider, subject, display_name, email)` | ユーザー登録（[UC-01](usecases/onboarding.md#uc-01-ユーザー登録)） | 同上。加えて 2 テーブルへの冪等な書き込みが 1 文で書けない |
+| `register_user(user_id, provider, subject, display_name, email)` | ユーザー登録（[UC-01](usecases/onboarding.md#uc-01-ユーザー登録)） | 同上。加えて 2 テーブルへの冪等な書き込みが 1 文で書けない |
 | `register_device(platform, push_token, apns_env)` | 端末の所有者付け替え（[UC-02](usecases/onboarding.md#uc-02-デバイストークンの登録)） | 対象が他人の行。許すポリシーは端末乗っ取りを許すことになる |
 | `join_group_by_invite_code(code)` | 招待コードでの参加（[UC-05](usecases/groups.md#uc-05-招待コードでグループに参加)） | 参加前は非メンバーなので `groups` が一行も見えない |
 

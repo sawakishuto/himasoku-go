@@ -98,9 +98,9 @@ sequenceDiagram
         API-->>iOS: 404 Not Found
         Note over iOS: プロフィール設定画面へ
         iOS->>API: POST /users (display_name, email)
-        API->>DB: SELECT * FROM register_user('firebase', sub, display_name, email)
-        DB-->>API: 確定した行と、新規作成かどうか
-        API-->>iOS: 201 Created (プロフィール)
+        API->>DB: SELECT register_user(採番した id, 'firebase', sub, display_name, email)
+        DB-->>API: 確定した users.id
+        API-->>iOS: 201 Created
     end
 ```
 
@@ -132,9 +132,8 @@ ON CONFLICT (provider, subject) DO NOTHING;
 
 ```sql
 BEGIN
-    INSERT INTO users ... RETURNING id INTO v_user_id;
+    INSERT INTO users (id, ...) VALUES (p_user_id, ...) RETURNING id INTO v_user_id;
     INSERT INTO user_identities (user_id, provider, subject) VALUES (...);
-    v_created := true;
 EXCEPTION WHEN unique_violation THEN
     -- 同時に別のリクエストが作った。このブロックの変更だけが巻き戻る
     SELECT i.user_id INTO v_user_id FROM user_identities i
@@ -145,8 +144,18 @@ EXCEPTION WHEN unique_violation THEN
 END;
 ```
 
-戻り値の `created` で `201` と `200` を出し分ける。
 `POST /users` は冪等なので、再送やリトライで壊れない。
+再送でも `201` を返す。既に登録済みなら既存の行に落ち着くだけで、
+新規かどうかをクライアントが使う場面が無い。
+
+### ID はアプリ側で採番する
+
+`register_user()` は `p_user_id` を受け取る。DB 側で採番すると、
+アプリは関数が返るまで自分が作った行の ID を知らず、失敗時のログと
+実際に入った行を突き合わせられない。
+
+ただし**返り値は必ず受け取る**。先に別のリクエストが同じ `sub` で
+登録していれば既存の行の ID が返り、渡した ID はどこにも存在しない。
 
 ### 表示名の扱い
 
