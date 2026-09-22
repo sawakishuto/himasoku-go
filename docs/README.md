@@ -10,7 +10,7 @@
 
 | ID | ユースケース | ドキュメント |
 |----|-------------|-------------|
-| UC-01 | サインインとユーザーの自動プロビジョニング | [オンボーディング](usecases/onboarding.md#uc-01-サインインとユーザーの自動プロビジョニング) |
+| UC-01 | ユーザー登録 | [オンボーディング](usecases/onboarding.md#uc-01-ユーザー登録) |
 | UC-02 | デバイストークンの登録 | [オンボーディング](usecases/onboarding.md#uc-02-デバイストークンの登録) |
 | UC-03 | プロフィールの取得 | [オンボーディング](usecases/onboarding.md#uc-03-プロフィールの取得) |
 | UC-04 | グループの作成 | [グループ](usecases/groups.md#uc-04-グループの作成) |
@@ -58,8 +58,32 @@ Authorization: Bearer <Firebase ID Token>
 ```
 
 API は Firebase の公開鍵で ID トークンを RS256 検証し、ペイロードの `sub` を
-`firebase_uid` として扱う。以降 `users.id` を引いて `current_user` とする。
-検証に失敗した場合は `401` を返す。
+`firebase_uid` として扱う。検証に失敗した場合は `401` を返す。
+
+認証層が行うのは検証と `users` の **参照** までで、行の作成は行わない。
+そのため「トークンは有効だが `users` に行が無い」状態が存在し、
+エンドポイントは要求するものによって 3 つの層に分かれる。
+
+| 層 | 対象 | 未登録のとき |
+|----|------|-------------|
+| 認証不要 | `GET /health` | — |
+| 認証のみ | `GET /me`, `POST /users` | 通す |
+| 認証 + 登録済み | それ以外すべて | `403 registration_required` |
+
+詳細は [UC-01](usecases/onboarding.md#uc-01-ユーザー登録) を参照。
+
+### 認可
+
+アプリのバグがそのまま他人のデータの露出にならないよう、`users` を除く
+全テーブルに Row Level Security を設定している。API は RLS が適用される
+専用ロールで接続し、トランザクションごとに実行主体を DB へ伝える。
+
+```sql
+SET LOCAL app.current_user_id = '<users.id>';
+```
+
+ポリシーの一覧と、境界をまたぐ操作の扱いは
+[テーブル設計](schema.md#row-level-security) を参照。
 
 ### 識別子
 

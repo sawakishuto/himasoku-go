@@ -5,15 +5,68 @@
 
 ---
 
-## UC-01 サインインとユーザーの自動プロビジョニング
+## 認証と登録を分ける
+
+サインイン（本人確認）とユーザー登録（プロフィールの永続化）は別の関心事として扱う。
+認証ミドルウェアは ID トークンを検証し、`sub` から `users` を **引くだけ** で、
+行が無くてもエラーにしない。行を作るかどうかを決めるのは `POST /users` だけ。
+
+この結果、リクエストは 3 つの層のいずれかに属する。
+
+| 層 | 対象 | 要求すること |
+|----|------|-------------|
+| 認証不要 | `GET /health` | なし |
+| 認証のみ | `GET /me`, `POST /users` | 有効な ID トークン |
+| 認証 + 登録済み | それ以外すべて | 有効な ID トークンと `users` の行 |
+
+`GET /health` を保護しないのは、Cloud Run やロードバランサが資格情報を持たずに
+死活監視を叩くため。保護するとすべて失敗する。
+
+```mermaid
+flowchart LR
+    R[リクエスト] --> A{ID トークンは有効か}
+    A -->|いいえ| E401[401 Unauthorized]
+    A -->|はい| B[sub で users を引く<br/>見つからなくてもよい]
+    B --> C{登録必須のルートか}
+    C -->|いいえ<br/>GET /me, POST /users| H[ハンドラへ]
+    C -->|はい| D{users の行はあるか}
+    D -->|いいえ| E403[403 Forbidden<br/>registration_required]
+    D -->|はい| H
+```
+
+「認証は通るが `users` に行が無い」という状態は、この設計で新しく生まれる。
+扱いを 1 箇所に閉じ込めるため、判定はミドルウェアの層で行い、個々のハンドラには
+`current_user` が必ず存在する前提を与える。
+
+### 実行主体を DB に伝える
+
+`users` の行が確定したら、トランザクションの冒頭でセッション変数を設定する。
+[Row Level Security](../schema.md#row-level-security) のポリシーがこの値を読む。
+
+```sql
+SET LOCAL app.current_user_id = '<users.id>';
+```
+
+`SET LOCAL` であることが重要で、`SET` だと接続プールに値が残り、
+同じ接続を再利用した **別の利用者のリクエストに前の利用者の権限が漏れる**。
+必ずトランザクション内で `SET LOCAL` を使う。
+
+---
+
+## UC-01 ユーザー登録
 
 **アクター**: iOS 利用者
-**事前条件**: Firebase Auth でサインイン済み（ID トークンを保持している）
-**事後条件**: `users` に当人の行が存在し、以降のリクエストで `current_user` として解決できる
+**事前条件**: Firebase Auth（Google プロバイダ）でサインイン済み
+**事後条件**: `users` に当人の行が存在し、`current_user` として解決できる
 
-専用の「ユーザー登録 API」は呼ばない。認証ミドルウェアが未登録の
-`firebase_uid` を検出したら、その場で行を作る。iOS 側は初回起動と 2 回目以降で
-処理を分ける必要がない。
+`POST /users`
+
+```json
+{ "display_name": "さわき", "email": "sawaki@example.com" }
+```
+
+`firebase_uid` はリクエストボディで受け取らない。ID トークンの `sub` から取る。
+クライアントの申告を信じると、任意の利用者になりすませてしまう。
 
 ```mermaid
 sequenceDiagram
@@ -22,44 +75,80 @@ sequenceDiagram
     participant Firebase
     participant DB
 
-    iOS->>API: 任意の API 呼び出し (Authorization: Bearer <ID Token>)
+    Note over iOS: Google サインイン完了
+    iOS->>API: GET /me (Authorization: Bearer <ID Token>)
     API->>Firebase: 公開鍵を取得 (初回のみ。以降はメモリキャッシュ)
     Firebase-->>API: x509 証明書
-    API->>API: RS256 で署名検証し sub / name / email を取り出す
+    API->>API: RS256 で署名検証し sub を取り出す
+    API->>DB: SELECT * FROM users WHERE firebase_uid = $1
 
-    alt 署名が不正、または期限切れ
-        API-->>iOS: 401 Unauthorized
-    else 検証成功
-        API->>DB: SELECT * FROM users WHERE firebase_uid = $1
-        alt 未登録
-            API->>DB: INSERT INTO users (firebase_uid, display_name, email)
-            DB-->>API: 作成された行
-        else 登録済みだが display_name が空
-            API->>DB: UPDATE users SET display_name = $2 WHERE id = $1
-            DB-->>API: 更新された行
-        else 登録済み
-            DB-->>API: 既存の行
-        end
-        API->>API: current_user を確定して本来の処理へ
-        API-->>iOS: 本来のレスポンス
+    alt 登録済み
+        DB-->>API: ユーザー行
+        API-->>iOS: 200 OK (プロフィール)
+        Note over iOS: ホーム画面へ
+    else 未登録
+        DB-->>API: 0 件
+        API-->>iOS: 404 Not Found
+        Note over iOS: プロフィール設定画面へ
+        iOS->>API: POST /users (display_name, email)
+        API->>DB: INSERT ... ON CONFLICT (firebase_uid) DO UPDATE ... RETURNING *, (xmax = 0)
+        DB-->>API: 確定した行と、新規作成かどうか
+        API-->>iOS: 201 Created (プロフィール)
     end
 ```
 
-### 表示名の決定順序
+### 存在確認してから分岐しない
 
-トークンのクレームから次の優先順位で決める。
+`SELECT` で有無を調べてから `INSERT` を選ぶ書き方は競合する。
+2 つのリクエストが同時に「行が無い」と判断し、後発が UNIQUE 制約違反で
+`500` になる。アプリ起動直後に複数の API を並行で叩くと現実に起きる。
 
-1. `name`
-2. `display_name`
-3. `email` のローカル部（`@` より前）
+1 文の upsert にすれば分岐自体が消える。
+
+```sql
+INSERT INTO users (firebase_uid, display_name, email)
+VALUES ($1, $2, $3)
+ON CONFLICT (firebase_uid) DO UPDATE
+    SET display_name = EXCLUDED.display_name,
+        email        = COALESCE(EXCLUDED.email, users.email)
+RETURNING *, (xmax = 0) AS created;
+```
+
+`xmax = 0` は、その行がこのステートメントで新規挿入されたことを示す。
+更新された既存行では `xmax` に更新元のトランザクション ID が入る。
+これで `201` と `200` を同じクエリで出し分けられる。
+
+`POST /users` を冪等にしているので、再送やリトライで壊れない。
+
+### 表示名の扱い
+
+トークンの `name` クレームではなく、利用者が入力した値を正とする。
+Google アカウントの表示名とアプリ内の呼び名は別物でよい。
+クライアントが `display_name` を省略した場合のフォールバックは次の順序。
+
+1. トークンの `name`
+2. トークンの `email` のローカル部（`@` より前）
+
+### 途中離脱への対処
+
+Google サインインは完了したがプロフィール設定前にアプリを閉じる、という
+状態が発生しうる。Firebase にはアカウントがあり、こちらの DB には無い。
+
+次回起動時も `GET /me` が `404` を返すので、クライアントは同じ導線で
+オンボーディングに戻せる。**起動時に必ず `GET /me` を呼ぶ**ことが前提になる。
 
 ### 既存実装との差分
 
 | 項目 | Rails | Go |
 |------|-------|-----|
-| プロビジョニングの契機 | `ApplicationController#find_or_provision_user` | 同じ（認証ミドルウェア内） |
-| `POST /users` | あり（冪等な作成・補完） | **廃止**。自動プロビジョニングと役割が重複する |
+| プロビジョニングの契機 | 認証時に `find_or_provision_user` が暗黙に作成 | `POST /users` の明示的な呼び出し |
+| 認証層の副作用 | DB への書き込みあり | 参照のみ |
+| 表示名 | トークンの `name` を優先 | 利用者の入力を優先 |
 | 公開鍵のキャッシュ | Redis | プロセス内メモリ（TTL は `Cache-Control` に従う） |
+
+認証ミドルウェアから書き込みを外したのは、本人確認と業務データの永続化が
+別の関心事だから。混ざっていると、プロフィール項目を増やすたびに認証層を
+触ることになり、「トークンは有効だが登録を断りたい」といった要求にも応えられない。
 
 Redis を外した理由は、キャッシュ対象が Google の公開鍵のみで、
 数 KB かつ全インスタンスで同一のためプロセス内で十分なこと。
@@ -72,7 +161,7 @@ Redis を外した理由は、キャッシュ対象が Google の公開鍵のみ
 
 ## UC-02 デバイストークンの登録
 
-**アクター**: iOS 利用者
+**アクター**: 登録済みの利用者
 **事前条件**: APNs からデバイストークンを受け取っている
 **事後条件**: `devices` に有効な行が存在し、通知の送信先として引き当てられる
 
@@ -90,20 +179,25 @@ sequenceDiagram
 
     Note over iOS: didRegisterForRemoteNotificationsWithDeviceToken
     iOS->>API: POST /devices (push_token, platform, apns_environment)
-    API->>DB: SELECT * FROM devices WHERE push_token = $1
+    API->>DB: SET LOCAL app.current_user_id = <users.id>
+    API->>DB: SELECT * FROM register_device($1, $2, $3)
 
-    alt 未登録
-        API->>DB: INSERT INTO devices (user_id, platform, push_token, ...)
-    else 同じユーザーの登録済みトークン
-        API->>DB: UPDATE devices SET last_registered_at = now(), revoked_at = NULL
-    else 別ユーザーに紐づいたトークン
-        Note over API,DB: 端末の譲渡や再サインイン。所有者を付け替える
-        API->>DB: UPDATE devices SET user_id = $2, last_registered_at = now(), revoked_at = NULL
-    end
-
-    DB-->>API: 確定した行
+    Note over DB: push_token で upsert し、所有者を呼び出し元に付け替える
+    DB-->>API: 確定した devices 行
     API-->>iOS: 200 OK (device)
 ```
+
+### UC-01 と同じ POST にまとめない
+
+APNs のデバイストークンは取得タイミングを制御できない。
+`didRegisterForRemoteNotificationsWithDeviceToken` が呼ばれるのは OS 都合で、
+プロフィール設定を終えた瞬間に手元にあるとは限らない。
+
+まとめると、トークンが来るまで登録を待つ（通知を許可しない利用者が
+登録できない）か、トークンを省略可能にする（結局あとで `POST /devices`
+が必要）かのどちらかになる。さらにトークンは再発行されるため、
+更新用の経路はどのみち必要で、まとめると `devices` への書き込みが
+2 箇所に分かれて保守対象が増える。
 
 ### 所有者の付け替えが必要な理由
 
@@ -112,6 +206,16 @@ APNs のデバイストークンは端末に紐づくもので、利用者に紐
 送信先になる。付け替えを行わないと、前の利用者宛の通知が新しい利用者の端末に
 届いてしまう。`push_token` に UNIQUE 制約を置いているのは、この付け替えを
 1 行の更新で完結させるため。
+
+### なぜ関数越しに書くのか
+
+付け替えの対象は **他人の行** で、RLS のポリシー（`user_id = app_current_user_id()`）
+では表現できない。かといって「他人の devices も更新できる」ポリシーを置くと、
+端末を乗っ取る手段を与えることになる。
+
+`register_device()` を `SECURITY DEFINER` にして、関数そのものを検査点にする。
+`push_token` を知っていること自体がその端末の占有証明になるので、
+関数の中では「呼び出し元が渡したトークンの行だけ」を対象にできる。
 
 ### 失効の解除
 
@@ -127,15 +231,19 @@ APNs のデバイストークンは端末に紐づくもので、利用者に紐
 | 既存トークンの再登録 | そのまま `200` を返すだけ | `last_registered_at` を更新し、失効を解除する |
 | 別ユーザーのトークン | 考慮なし（前の所有者に紐づいたまま） | 所有者を付け替える |
 | プラットフォーム | APNs 固定 | `platform` 列で ios / android を区別 |
+| 他人の端末の可視性 | 制限なし | RLS で自分の行のみ |
 
 ---
 
 ## UC-03 プロフィールの取得
 
-**アクター**: iOS 利用者
+**アクター**: サインイン済みの利用者（登録の有無を問わない）
 **事後条件**: なし（参照のみ）
 
 `GET /me`
+
+このエンドポイントは **登録済みかどうかをクライアントに伝える** 役割を兼ねる。
+アプリ起動時に必ず呼び、ステータスコードで遷移先を分ける。
 
 ```mermaid
 sequenceDiagram
@@ -144,10 +252,28 @@ sequenceDiagram
     participant DB
 
     iOS->>API: GET /me
-    API->>DB: SELECT id, display_name, email FROM users WHERE id = $1
-    DB-->>API: ユーザー行
-    API-->>iOS: 200 OK (id, display_name, email)
+    API->>DB: SELECT id, display_name, email FROM users WHERE firebase_uid = $1
+
+    alt 登録済み
+        DB-->>API: ユーザー行
+        API-->>iOS: 200 OK (id, display_name, email)
+        Note over iOS: ホーム画面へ
+    else 未登録
+        DB-->>API: 0 件
+        API-->>iOS: 404 Not Found
+        Note over iOS: オンボーディングへ (UC-01)
+    end
 ```
+
+### 検証専用のエンドポイントは作らない
+
+「トークンを検証して成功だけ返す」エンドポイントには情報量が無い。
+クライアントは既にトークンを持っていて、Firebase SDK 自身が有効性を知っている。
+サーバーが「検証できました」と返しても、クライアントが新たに得るものは無く、
+往復のレイテンシだけが増える。
+
+一方「登録が済んでいるか」はサーバーにしか分からない。`GET /me` の
+ステータスコードでそれを伝えれば、専用エンドポイントは不要になる。
 
 ### 既存実装との差分
 
