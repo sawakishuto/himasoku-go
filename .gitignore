@@ -20,6 +20,10 @@ coverage.html
 *.key
 *.cer
 
+# Firebase サービスアカウント鍵
+*serviceAccount*.json
+*-firebase-adminsdk-*.json
+
 # エディタ・OS
 .DS_Store
 .idea/

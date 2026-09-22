@@ -14,6 +14,11 @@ MIGRATIONS_DIR := db/migrations
 DATABASE_URL     ?= postgres://himasoku:himasoku@localhost:15432/himasoku?sslmode=disable
 APP_DATABASE_URL ?= postgres://himasoku_app:himasoku_app@localhost:15432/himasoku?sslmode=disable
 
+# make 変数はレシピの環境変数にはならない。export しないと make run が
+# APP_DATABASE_URL is not set で落ちる。
+export DATABASE_URL
+export APP_DATABASE_URL
+
 .PHONY: help
 help: ## このヘルプを表示
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
