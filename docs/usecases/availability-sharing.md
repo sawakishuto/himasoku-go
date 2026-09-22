@@ -18,10 +18,10 @@ sequenceDiagram
     participant メンバー as メンバーの iOS
 
     共有者->>API: POST /availabilities (UC-09)
-    API->>DB: availabilities / notifications / notification_deliveries を作成
+    API->>DB: availabilities と、宛先ごとの notifications を作成
     API-->>共有者: 201 Created
 
-    Worker->>DB: pending の配信を取り出す (UC-14)
+    Worker->>DB: 未展開の notifications を端末ごとの配信に展開 (UC-14)
     Worker->>APNs: 招待通知を送信
     APNs->>メンバー: HIMASOKU_INVITE カテゴリの通知
 
@@ -74,16 +74,8 @@ sequenceDiagram
         API->>DB: SELECT user_id FROM group_members WHERE group_id = $1 AND left_at IS NULL AND user_id <> $2
         DB-->>API: 宛先ユーザーの配列
 
-        loop 宛先ごと
-            API->>DB: INSERT INTO notifications (kind, availability_id, recipient_user_id, title, body, payload)
-        end
-
-        API->>DB: SELECT id, user_id FROM devices WHERE user_id = ANY($1) AND revoked_at IS NULL
-        DB-->>API: 有効な端末の配列
-
-        loop 通知 × 端末
-            API->>DB: INSERT INTO notification_deliveries (notification_id, device_id, status) VALUES (..., 'pending')
-        end
+        API->>DB: INSERT INTO notifications (id, kind, availability_id, recipient_user_id, ...) を宛先ぶん
+        Note over API,DB: id は Go 側で採番する。RETURNING は RLS で使えない
 
         API->>DB: COMMIT
         API-->>iOS: 201 Created (availability)
@@ -117,8 +109,32 @@ iOS は `notification_id` を未応答検知の待機タスク ID として使�
 
 ### 配信は同期で送らない
 
-API は `notification_deliveries` を `pending` で積むところまでを行い、
+API は `notifications` を作るところまでを行い、端末ごとの配信への展開と
 APNs への送信は [UC-14](notification-delivery.md#uc-14-通知を配信する) のワーカーに委ねる。
+`notifications` がアウトボックスの入口になる。
+
+### 端末の引き当てを API で行わない
+
+送信先の `devices` は [RLS](../schema.md#row-level-security) により
+自分の行しか見えない。「同じグループなら見える」ポリシーを置くこともできるが、
+それはデバイストークンをメンバー間に開示するということで、割に合わない。
+
+端末一覧が要るのは実際に送る瞬間だけなので、その責務ごとワーカーに移す。
+副次的な利点として、**共有した時点ではなく送信する時点の端末一覧**が使われる。
+その間に端末を登録した利用者にも届く。
+
+### 通知の INSERT に RETURNING を付けない
+
+通知は常に他人宛に作られる。`RETURNING` は挿入行の読み返しなので、
+`notifications` の SELECT ポリシー（自分宛のみ）に掛かって失敗する。
+`id` は iOS のペイロードに載せる必要があるため、Go 側で採番して INSERT に渡す。
+
+### 在籍チェックは二重になる
+
+ハンドラで在籍を確認して `404` を返すのとは別に、`availabilities` の
+INSERT ポリシーが `自分 かつ 在籍中` を要求する。ハンドラ側の確認は
+利用者に分かりやすいエラーを返すため、ポリシーは確認を書き忘れたときの
+保険として働く。
 
 ### 既存実装との差分
 
@@ -172,7 +188,7 @@ sequenceDiagram
                 API-->>メンバー: 200 OK (冪等。結果通知は再送しない)
             else 初回の応答
                 API->>DB: INSERT INTO notifications (kind='response_result', recipient_user_id=共有者)
-                API->>DB: INSERT INTO notification_deliveries (...) VALUES (..., 'pending')
+                Note over API,DB: 端末への展開はワーカーが行う (UC-14)
                 API-->>メンバー: 201 Created
             end
         end
@@ -289,11 +305,20 @@ sequenceDiagram
     alt 対象行なし (他人の暇、または取り消し済み)
         API-->>iOS: 404 Not Found
     else 更新成功
-        API->>DB: DELETE FROM notification_deliveries WHERE notification_id IN (...) AND status = 'pending'
-        Note over API,DB: 未送信ぶんだけ取り消す。送信済みは APNs から戻せない
+        Note over API,DB: 未送信ぶんの送信抑止はワーカー側で行う (UC-14)
         API-->>iOS: 204 No Content
     end
 ```
+
+### 未送信の通知を止める方法
+
+`cancelled_at` を打刻するだけで、API は配信行に触れない。
+`notification_deliveries` の作成も削除もワーカーの担当で、
+API ロールには権限がないため。
+
+ワーカーは取り出し時に `availabilities.cancelled_at IS NULL` を条件に加える。
+取り消しから送信までの間に APNs へ渡ってしまったぶんは戻せないが、
+これは経路をどう分けても同じで、同期送信でも変わらない。
 
 取り消しは論理削除にする。物理削除にすると、既に届いた招待通知に対する
 応答が外部キー制約で失敗し、クライアントがエラーを受け取ることになる。

@@ -74,22 +74,31 @@ sequenceDiagram
     participant DB
 
     iOS->>API: POST /groups/join (invite_code)
-    API->>DB: SELECT * FROM groups WHERE invite_code = $1
+    API->>DB: SET LOCAL app.current_user_id = <users.id>
+    API->>DB: SELECT * FROM join_group_by_invite_code($1)
+
+    Note over DB: コードを照合し、在籍行が無ければ作る
 
     alt 該当なし
+        DB-->>API: NULL
         API-->>iOS: 404 Not Found
     else 該当あり
-        API->>DB: INSERT INTO group_members (group_id, user_id)
-        alt 既に在籍中
-            Note over DB: group_members_active_uniq に違反
-            DB-->>API: unique violation
-            API-->>iOS: 200 OK (冪等に成功として扱う)
-        else 新規、または退出後の再参加
-            DB-->>API: 作成された行
-            API-->>iOS: 201 Created (group)
-        end
+        DB-->>API: groups 行
+        API-->>iOS: 201 Created (group)
     end
 ```
+
+### 参加は関数越しに行う
+
+参加する前の利用者はそのグループの非メンバーなので、RLS のポリシー
+（`groups` は在籍中のものだけ可視）により `groups` が **一行も見えない**。
+アプリから `SELECT * FROM groups WHERE invite_code = $1` を投げても
+必ず 0 件になる。
+
+非メンバーにも `groups` の SELECT を許すと、招待コードの総当たりや
+グループ一覧の列挙ができてしまう。照合を `join_group_by_invite_code()`
+という `SECURITY DEFINER` 関数の内側だけに閉じ込め、
+「コードを正しく知っている場合にだけ在籍行が増える」状態にする。
 
 ### 在籍の一意性
 
@@ -105,6 +114,17 @@ CREATE UNIQUE INDEX group_members_active_uniq
 結果として「在籍中の重複は禁止」と「退出後の再参加は許可」が同時に成立する。
 アプリ側で在籍チェックをしてから INSERT する方式だと、同時リクエストで
 両方がチェックを通過して二重に入る余地が残るが、この索引ならその隙間がない。
+
+関数の中では、同じ述語を `ON CONFLICT` に書いて対象を索引と一致させている。
+部分索引を推論させるには述語まで揃える必要がある。
+
+```sql
+INSERT INTO group_members (group_id, user_id)
+VALUES (v_group.id, v_user_id)
+ON CONFLICT (group_id, user_id) WHERE left_at IS NULL DO NOTHING;
+```
+
+これで二重参加が例外ではなく「何もしない」で済み、再送に対して冪等になる。
 
 ---
 

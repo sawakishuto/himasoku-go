@@ -160,10 +160,15 @@ UNIQUE (`availability_id`, `user_id`) により二重応答を DB が弾く。
 | `recipient_user_id` | `uuid` | NOT NULL → `users(id)` ON DELETE CASCADE |
 | `title` / `body` | `text` | NOT NULL |
 | `payload` | `jsonb` | NOT NULL DEFAULT `'{}'` |
+| `expanded_at` | `timestamptz` | 端末ごとの配信へ展開した打刻 |
 | `created_at` | `timestamptz` | NOT NULL |
 
 宛先 1 人につき 1 行。iOS が `notification_id` を未応答検知のキーに使うため、
 受信者ごとに一意である必要がある。
+
+`expanded_at IS NULL` の部分索引が、配信ワーカーの展開フェーズの取り出し口に
+なる。有効な端末が 1 台も無い利用者宛の通知は配信行が 0 件になるため、
+`notification_deliveries` の有無では展開済みかを判定できない。
 
 ### notification_deliveries
 
@@ -182,6 +187,127 @@ UNIQUE (`availability_id`, `user_id`) により二重応答を DB が弾く。
 `status = 'pending'` の部分索引が、そのまま配信ワーカーの取り出し口
 （アウトボックス）として機能する。
 
+## Row Level Security
+
+`WHERE user_id = $1` の付け忘れや、パスパラメータの検証漏れは、
+レビューをすり抜ければそのまま他人のデータの露出になる。
+アプリ側の正しさだけに依存しないよう、DB 側に最後の防波堤を置く。
+
+定義は [`000009_enable_row_level_security.up.sql`](../db/migrations/000009_enable_row_level_security.up.sql)。
+
+### 接続ロールを分ける
+
+**RLS はテーブル所有者には既定で適用されない。** 現在の `himasoku` は
+Superuser かつ `BYPASSRLS` を持つため、このロールで接続している限り
+ポリシーは一切評価されない。接続を用途で分けることが前提になる。
+
+| ロール | 接続文字列 | RLS | 用途 |
+|--------|-----------|-----|------|
+| `himasoku` | `DATABASE_URL` | 素通り | マイグレーション、配信ワーカー |
+| `himasoku_app` | `APP_DATABASE_URL` | 適用される | API のリクエスト処理 |
+
+API が誤って `DATABASE_URL` で接続すると、**エラーも警告も出ないまま
+RLS が無効になる**。この点だけは設定ミスが静かに失敗するので注意する。
+
+### 実行主体の伝え方
+
+ポリシーは `app_current_user_id()` を通してセッション変数を読む。
+
+```sql
+SET LOCAL app.current_user_id = '<users.id>';
+```
+
+`SET LOCAL` はトランザクション終了時に自動で巻き戻る。`SET` を使うと
+接続プールに値が残り、同じ接続を再利用した別の利用者のリクエストに
+前の利用者の権限が引き継がれる。
+
+未設定なら `app_current_user_id()` は `NULL` を返し、すべての比較が
+`NULL`（偽）になって一行も見えない。設定忘れは安全側に倒れる。
+
+### ポリシー一覧
+
+| テーブル | SELECT | INSERT | UPDATE |
+|---------|--------|--------|--------|
+| `users` | RLS なし | RLS なし | RLS なし |
+| `devices` | 自分の行のみ | 自分の行のみ | 自分の行のみ |
+| `groups` | 在籍中のグループ | `created_by` が自分 | ポリシーなし（不可） |
+| `group_members` | 在籍中のグループの全員 | 自分の行のみ | 自分の行のみ |
+| `availabilities` | 在籍中のグループのもの | 自分 かつ 在籍中 | 自分の行のみ |
+| `availability_responses` | 自分の応答、自分の暇への応答 | 自分 かつ 暇が可視 | ポリシーなし（不可） |
+| `notifications` | 自分宛のみ | 下記の条件 | ポリシーなし（不可） |
+| `notification_deliveries` | 自分宛の通知のぶん | ポリシーなし（不可） | ポリシーなし（不可） |
+
+ポリシーを置かないことは「一行も対象にならない」を意味する。
+該当するユースケースが無い操作は、明示的に禁止するより
+定義しないほうが安全側に倒れる。
+
+### users に RLS を掛けない理由
+
+2 つある。
+
+1. 認証ミドルウェアは `firebase_uid` から `users.id` を引く。この時点では
+   `app.current_user_id` がまだ確定しておらず、自分の行すら見えない。
+2. [UC-07](usecases/groups.md#uc-07-グループメンバーの一覧) で同じグループの
+   他人の `display_name` を読む必要がある。「自分の行だけ」では成立しない。
+
+代償として、アプリロールは全ユーザーの `email` と `firebase_uid` を
+読めてしまう。外部に出す列はハンドラ側で絞る。
+
+### なりすましをポリシーで塞ぐ
+
+`notifications` の INSERT は、送信者の申告ではなく DB 上の事実だけを見る。
+
+| `kind` | 作成が許される条件 |
+|--------|------------------|
+| `availability_invite` | 対象の暇が自分のもの **かつ** 宛先が同じグループの在籍者 |
+| `response_result` | 対象の暇の共有者が宛先 **かつ** 自分がその暇に応答済み |
+
+Rails 版は `sender_firebase_uid` を自己申告で受け取っていたため、
+認証さえ通れば任意の相手に「◯◯が共感しています」を送れた。
+アプリ側で直したとしても、次に同じ経路を書いた人が同じ穴を開けられる。
+ポリシーにしておけば DB が拒否する。
+
+### 通知の INSERT に RETURNING は使えない
+
+通知は常に他人宛に作られる。`RETURNING` は挿入した行を読み返す操作なので、
+`notifications` の SELECT ポリシー（自分宛のみ）に掛かって失敗する。
+
+```
+ERROR:  new row violates row-level security policy for table "notifications"
+```
+
+書き込み自体は `WITH CHECK` を通っており、失敗するのは読み返しだけ。
+`id` が必要なときは Go 側で uuid を採番して渡す（sqlc なら `:exec`）。
+
+### 境界をまたぐ操作
+
+ポリシーで表現できない操作が 2 つある。いずれも `SECURITY DEFINER`
+関数に閉じ込め、関数そのものを検査点にしている。
+
+| 関数 | 用途 | ポリシーで書けない理由 |
+|------|------|---------------------|
+| `register_device(platform, push_token, apns_env)` | 端末の所有者付け替え（[UC-02](usecases/onboarding.md#uc-02-デバイストークンの登録)） | 対象が他人の行。許すポリシーは端末乗っ取りを許すことになる |
+| `join_group_by_invite_code(code)` | 招待コードでの参加（[UC-05](usecases/groups.md#uc-05-招待コードでグループに参加)） | 参加前は非メンバーなので `groups` が一行も見えない |
+
+`app_is_group_member(group_id)` も `SECURITY DEFINER` にしている。
+`group_members` のポリシーから `group_members` を引くと
+`infinite recursion detected in policy for relation "group_members"`
+になるため、所有者として実行して RLS を経由しない。
+
+### 配信行はワーカーが作る
+
+`notification_deliveries` の作成には宛先の `devices.id` が要るが、
+他人の端末は RLS で見えない。「同じグループなら端末が見える」ポリシーを
+置くと、デバイストークンをメンバー間に開示することになる。
+
+そのため **API は `notifications` までを作り、それを端末ごとに展開して
+`notification_deliveries` を作るのはワーカーの役割** とする。
+ワーカーは所有者接続で動くので全端末を引ける。
+
+結果として `notifications` がアウトボックスの入口、
+`notification_deliveries` が出口になる。共有時点ではなく送信時点の
+端末一覧を使うため、その間に登録された端末にも届くという副次的な利点がある。
+
 ## 既存スキーマからの変更点
 
 | 既存（Rails） | 新設計（Go） | 理由 |
@@ -194,4 +320,5 @@ UNIQUE (`availability_id`, `user_id`) により二重応答を DB が弾く。
 | 応答がクライアント申告 | `availability_responses` | 送信者とグループをサーバーが導出でき、なりすましを防げる |
 | `notification_id` を毎回生成して破棄 | `notifications` | 応答との突き合わせ、再送、監査ができる |
 | 送信結果は JSON で返すだけ | `notification_deliveries` | 非同期送信のキューを兼ね、無効トークンを自動失効できる |
+| 行の可視性はアプリ任せ | `users` 以外に RLS | `WHERE` の付け忘れが他人のデータの露出にならない |
 | `simple_users` など 4 テーブル | 廃止 | 現行コードから未使用。旧スキーマの名残 |

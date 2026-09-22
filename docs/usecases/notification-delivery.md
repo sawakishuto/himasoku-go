@@ -1,22 +1,39 @@
 # 通知配信
 
-`notification_deliveries` に積まれた配信を APNs へ送り、結果を記録するまで。
-API のリクエスト処理とは独立した非同期の経路になる。
+`notifications` に積まれた通知を端末ごとの配信に展開し、APNs へ送って
+結果を記録するまで。API のリクエスト処理とは独立した非同期の経路になる。
 [ドキュメント一覧に戻る](../README.md)
+
+ワーカーは所有者ロール（`DATABASE_URL`）で接続する。全利用者の `devices` を
+引く必要があり、[RLS](../schema.md#row-level-security) が適用される
+アプリロールでは送信先を引き当てられないため。
 
 ---
 
 ## UC-14 通知を配信する
 
 **アクター**: 配信ワーカー（利用者の操作を伴わない）
-**事前条件**: `notification_deliveries` に `status = 'pending'` の行がある
-**事後条件**: 各行が `sent` または `failed` に遷移している
+**事前条件**: `notifications` に `expanded_at IS NULL` の行、または
+`notification_deliveries` に `status = 'pending'` の行がある
+**事後条件**: 各配信行が `sent` または `failed` に遷移している
 
 ```mermaid
 sequenceDiagram
     participant Worker
     participant DB
     participant APNs
+
+    rect rgb(245, 245, 245)
+        Note over Worker,DB: 展開フェーズ
+        Worker->>DB: SELECT n.* FROM notifications n JOIN availabilities a ON a.id = n.availability_id<br/>WHERE n.expanded_at IS NULL AND a.cancelled_at IS NULL FOR UPDATE SKIP LOCKED
+        DB-->>Worker: 未展開の通知
+
+        Worker->>DB: SELECT id FROM devices WHERE user_id = $1 AND revoked_at IS NULL
+        DB-->>Worker: 宛先の端末（送信する時点の一覧）
+
+        Worker->>DB: INSERT INTO notification_deliveries (notification_id, device_id, status) VALUES (..., 'pending')
+        Worker->>DB: UPDATE notifications SET expanded_at = now()
+    end
 
     loop 一定間隔でポーリング
         Worker->>DB: BEGIN
@@ -44,6 +61,36 @@ sequenceDiagram
             end
         end
     end
+```
+
+### 展開をワーカーが担う理由
+
+`notification_deliveries` を作るには宛先の `devices.id` が要るが、
+API ロールには他人の端末が見えない。「同じグループなら見える」ポリシーを
+置くことはできても、デバイストークンをメンバー間に開示することになる。
+
+そこで API は `notifications` までを作り（[UC-09](availability-sharing.md#uc-09-暇を共有する)）、
+端末への展開はワーカーが所有者接続で行う。結果として
+`notifications` がアウトボックスの入口、`notification_deliveries` が出口になる。
+
+副次的な利点が 2 つある。
+
+- **送信する時点の端末一覧を使う。** 共有から送信までの間に端末を登録した
+  利用者にも届く。共有時点で確定させると取りこぼす。
+- **取り消しを展開前に反映できる。** `availabilities.cancelled_at IS NULL`
+  を取り出し条件に入れておけば、[UC-13](availability-sharing.md#uc-13-暇の共有を取り消す)
+  で取り消された暇の通知は配信行にすらならない。
+
+### 展開済みを打刻する
+
+`expanded_at` が無いと、有効な端末が 1 台も無い利用者宛の通知が
+毎回の走査に現れ続ける。配信行が 0 件でも展開は完了しているため、
+`notification_deliveries` の有無では判定できない。
+
+```sql
+CREATE INDEX notifications_unexpanded_idx
+    ON notifications (created_at)
+    WHERE expanded_at IS NULL;
 ```
 
 ### 取り出しに FOR UPDATE SKIP LOCKED を使う
