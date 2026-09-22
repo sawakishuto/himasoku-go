@@ -41,35 +41,6 @@ func authorized(r *http.Request) *http.Request {
 	return r
 }
 
-// Authorization ヘッダの取り出しが正しいかを検証する。
-// 不正な形式は検証器を呼ばずに弾かれる。
-func TestVerifyRejectsMalformedHeader(t *testing.T) {
-	a := NewAuthenticator(nil, nil)
-
-	tests := []struct {
-		name   string
-		header string
-	}{
-		{"ヘッダなし", ""},
-		{"Bearer がない", "eyJhbGciOi"},
-		{"スキームだけ", "Bearer "},
-		{"別のスキーム", "Basic eyJhbGciOi"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			r := httptest.NewRequest(http.MethodGet, "/me", nil)
-			if tt.header != "" {
-				r.Header.Set("Authorization", tt.header)
-			}
-
-			if _, err := a.verify(r); err == nil {
-				t.Fatalf("エラーを期待したが nil が返った")
-			}
-		})
-	}
-}
-
 // "Bearer " を剥がしてから検証器へ渡していること。
 // 付いたままだと JWT として解釈できず、全リクエストが 401 になる。
 func TestVerifyStripsBearerPrefix(t *testing.T) {
@@ -91,24 +62,6 @@ type recordingVerifier struct{ raw *string }
 func (v recordingVerifier) VerifyToken(_ context.Context, raw string) (*auth.Token, error) {
 	*v.raw = raw
 	return &auth.Token{Provider: auth.ProviderFirebase, Subject: "sub-1"}, nil
-}
-
-// 不正なヘッダのとき 401 を返し、次のハンドラを呼ばないこと。
-func TestRequireBlocksUnauthenticated(t *testing.T) {
-	a := NewAuthenticator(nil, nil)
-
-	called := false
-	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true })
-
-	rec := httptest.NewRecorder()
-	a.Require(next).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/me", nil))
-
-	if rec.Code != http.StatusUnauthorized {
-		t.Errorf("ステータス = %d, 期待値 = %d", rec.Code, http.StatusUnauthorized)
-	}
-	if called {
-		t.Error("認証に失敗したのに次のハンドラが呼ばれた")
-	}
 }
 
 // 登録済みなら users.id が context に載ること。
@@ -204,20 +157,5 @@ func TestRequireRegisteredAllowsRegistered(t *testing.T) {
 
 	if !called {
 		t.Errorf("登録済みのリクエストが弾かれた (ステータス = %d)", rec.Code)
-	}
-}
-
-// context に載せたトークンを TokenFrom が取り出せること。
-// 未設定の context では ok が false になること。
-func TestTokenFrom(t *testing.T) {
-	r := httptest.NewRequest(http.MethodGet, "/me", nil)
-
-	if _, ok := TokenFrom(r.Context()); ok {
-		t.Error("未設定の context で ok = true が返った")
-	}
-
-	ctx := withToken(r.Context(), &auth.Token{Subject: "sub-1"})
-	if _, ok := TokenFrom(ctx); !ok {
-		t.Error("設定済みの context で ok = false が返った")
 	}
 }

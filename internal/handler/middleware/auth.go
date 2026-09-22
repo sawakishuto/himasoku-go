@@ -64,6 +64,7 @@ func (a *Authenticator) Require(next http.Handler) http.Handler {
 func (a *Authenticator) RequireRegistered(next http.Handler) http.Handler {
 	return a.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := UserIDFrom(r.Context()); !ok {
+
 			// 401 にしない。トークンは有効で、足りないのは登録だけ。
 			// 再認証を促しても解決せず、クライアントは無限に往復する。
 			http.Error(w, `{"error":"registration_required"}`, http.StatusForbidden)
