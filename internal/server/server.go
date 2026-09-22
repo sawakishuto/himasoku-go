@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sawakishuto/himasoku-go/internal/auth"
+	"github.com/sawakishuto/himasoku-go/internal/domain/user/usecase"
 	"github.com/sawakishuto/himasoku-go/internal/handler"
 	"github.com/sawakishuto/himasoku-go/internal/handler/middleware"
 	"github.com/sawakishuto/himasoku-go/internal/infra/postgres"
@@ -41,6 +42,14 @@ func Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	// ヘルスチェックは資格情報を持たないので保護しない。
 	mux.HandleFunc("GET /health", handler.Health)
+
+	// 登録前の利用者が通れる唯一の経路なので、authn.Require 側に置く。
+	// Require はトークンを検証するだけで、登録の有無では止めない。
+	// RequireRegistered の下に置くと、登録するために登録済みである
+	// ことが必要になり、誰も登録できなくなる。
+	registration := usecase.NewUserRegistration(postgres.NewUserRepository(pool))
+	mux.Handle("POST /users", authn.Require(handler.CreateUser(registration)))
+
 	mux.Handle("/", authn.RequireRegistered(api))
 
 	srv := &http.Server{
