@@ -34,6 +34,7 @@ func (fc *FirebaseAuthClient) VerifyToken(ctx context.Context, rawToken string) 
 	}
 
 	return &Token{
+		Provider: ProviderFirebase,
 		AuthTime: int64(token.AuthTime),
 		Issuer:   string(token.Issuer),
 		Audience: string(token.Audience),

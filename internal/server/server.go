@@ -12,6 +12,7 @@ import (
 	"github.com/sawakishuto/himasoku-go/internal/auth"
 	"github.com/sawakishuto/himasoku-go/internal/handler"
 	"github.com/sawakishuto/himasoku-go/internal/handler/middleware"
+	"github.com/sawakishuto/himasoku-go/internal/infra/postgres"
 )
 
 func Run(ctx context.Context) error {
@@ -23,14 +24,24 @@ func Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to create firebase auth client: %w", err)
 	}
-	authn := middleware.NewAuthenticator(client)
 
-	// 認証が必要なルートはこちらに登録する。登録するだけで保護される。
+	pool, err := postgres.NewPool(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer pool.Close()
+
+	authn := middleware.NewAuthenticator(client, postgres.NewIdentityRepository(pool))
+
+	// 登録済みであることまで要求するルートはこちらに登録する。
+	// GET /me と POST /users だけは authn.Require で個別に登録する。
+	// 未登録の利用者がそこに到達できないと、永遠に登録できないため。
 	api := http.NewServeMux()
 
 	mux := http.NewServeMux()
+	// ヘルスチェックは資格情報を持たないので保護しない。
 	mux.HandleFunc("GET /health", handler.Health)
-	mux.Handle("/", authn.Require(api))
+	mux.Handle("/", authn.RequireRegistered(api))
 
 	srv := &http.Server{
 		Addr:    ":8080",
